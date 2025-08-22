@@ -1,0 +1,9 @@
+ctr_train.csv.gz
+ctr_test.csv.gz
+ctr_sample_submission.csv.gz
+
+ctr_train.csv
+ctr_test.csv
+ctr_sample_submission.csv
+
+myenv
