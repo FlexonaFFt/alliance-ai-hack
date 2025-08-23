@@ -10,9 +10,9 @@ from sklearn.feature_selection import SelectKBest, mutual_info_classif
 from tqdm import tqdm
 
 CFG_LIST = {
-    "light": dict(iterations=1000, depth=6, lr=0.08, n_sample=5_000_000, 
+    "mid1": dict(iterations=1000, depth=6, lr=0.08, n_sample=5_000_000, 
                  n_splits=3, subsample=0.8, colsample_bylevel=0.8, l2_leaf_reg=3),
-    "mid":   dict(iterations=1500, depth=8, lr=0.05, n_sample=10_000_000,
+    "mid2":   dict(iterations=1500, depth=8, lr=0.05, n_sample=10_000_000,
                  n_splits=5, subsample=0.85, colsample_bylevel=0.85, l2_leaf_reg=2),
     "pro":   dict(iterations=2000, depth=10, lr=0.035, n_sample=10_000_000,
                  n_splits=5, subsample=0.9, colsample_bylevel=0.9,
@@ -238,7 +238,6 @@ def main():
                 'features': all_features
             })
             
-            # Очистка памяти
             del model, X_tr, X_val
             gc.collect()
         

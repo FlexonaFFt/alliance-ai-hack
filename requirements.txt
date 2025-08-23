@@ -1,5 +1,7 @@
-pandas
+tqdm
 numpy
+pandas
+joblib
 scikit-learn
 lightgbm
 category_encoders
