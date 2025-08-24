@@ -1,5 +1,6 @@
 tqdm
 numpy
+torch
 pandas
 joblib
 scikit-learn

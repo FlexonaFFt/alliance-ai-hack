@@ -6,4 +6,8 @@ ctr_train.csv
 ctr_test.csv
 ctr_sample_submission.csv
 
+taskone/ctr_train
+taskone/ctr_test
+taskone/ctr_sample_submission
+
 myenv
