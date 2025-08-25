@@ -1,8 +1,11 @@
 tqdm
+eli5
 numpy
 torch
+optuna
 pandas
 joblib
 scikit-learn
 lightgbm
+catboost
 category_encoders
