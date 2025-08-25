@@ -53,6 +53,10 @@ def objective(trial, X, y, features, cat_features):
         X_tr, X_val = X.iloc[tr_idx][features], X.iloc[val_idx][features]
         y_tr, y_val = y[tr_idx], y[val_idx]
         
+        for col in cat_features:
+            X_tr[col] = X_tr[col].astype(str).fillna('NaN')
+            X_val[col] = X_val[col].astype(str).fillna('NaN')
+        
         train_pool = Pool(X_tr, y_tr, cat_features=cat_features)
         val_pool = Pool(X_val, y_val, cat_features=cat_features)
         
@@ -64,16 +68,21 @@ def objective(trial, X, y, features, cat_features):
     return np.mean(aucs)
 
 if __name__ == "__main__":
-    train = pd.read_csv("ctr_train.csv", nrows=5_000_000)
+    subsample_size = 3_000_000
+    train = pd.read_csv("ctr_train.csv", nrows=subsample_size)
     y = train['click'].values
     orig_features = [c for c in train.columns if c.startswith('ID_')]
+    
     for col in orig_features:
-        train[col] = train[col].astype(str)
+        train[col] = train[col].astype(str).fillna('NaN')
     
-    top_pairs = []  # Можно добавлять top пары из предыдущих подборов фичей
+    top_pairs = []
     train, features = feature_engineering(train, y, is_train=True, top_pairs=top_pairs, features=orig_features)
-    cat_features = [c for c in features if not c.endswith('_freq') and not c.endswith('_te')]
+    print("Feature types before Pool:")
+    for col in features:
+        print(f"{col}: {train[col].dtype}")
     
+    cat_features = [c for c in features if not c.endswith('_freq') and not c.endswith('_te')]
     study = optuna.create_study(direction='maximize')
     study.optimize(lambda trial: objective(trial, train, y, features, cat_features), n_trials=20)
     
