@@ -26,23 +26,31 @@ BLEND_W = dict(light=0.2, mid=0.4, pro=0.4)
 
 def feature_engineering(df, y=None, is_train=True, top_pairs=None, features=None):
     if features is None:
-        features = [c for c in df.columns if c.startswith('ID_')]
-    
+        features = [c for c in df.columns if c.startswith('site_') or c.startswith('app_') or c.startswith('device_')]
+
+    # частоты
     for col in features:
         freq = df[col].value_counts(normalize=True)
         df[col + '_freq'] = df[col].map(freq).fillna(0).astype(float)
-    
+
+    # target encoding только на train
     if is_train and y is not None:
         te = TargetEncoder(cols=features, smoothing=1.0)
         df[[col + '_te' for col in features]] = te.fit_transform(df[features], y)
-    
+
+    # взаимодействия
     if top_pairs is None:
         top_pairs = []
     for pair in top_pairs:
-        new_col = f"{pair[0]}_{pair[1]}"
-        df[new_col] = df[pair[0]].astype(str) + '_' + df[pair[1]].astype(str)
-    
-    new_features = [c for c in df.columns if c not in ['id', 'click'] and c not in features] + features + [f"{p[0]}_{p[1]}" for p in top_pairs]
+        if pair[0] in df.columns and pair[1] in df.columns: 
+            new_col = f"{pair[0]}_{pair[1]}"
+            df[new_col] = df[pair[0]].astype(str) + '_' + df[pair[1]].astype(str)
+
+    new_features = (
+        [c for c in df.columns if c not in ['id', 'click', 'idx'] and c not in features]
+        + features
+        + [f"{p[0]}_{p[1]}" for p in top_pairs if p[0] in df.columns and p[1] in df.columns]
+    )
     return df, new_features
 
 def select_features(model, X, y, features, threshold=0.01):
@@ -81,8 +89,15 @@ for name, cfg in CFG_LIST.items():
         selected_features = select_features(sub_model, sub_train[features], sub_y, features)
         
         inter_import = sub_model.get_feature_importance(type='Interaction')
-        top_pairs = [(features[i], features[j]) for i, j, score in inter_import[:5]]
-        
+        top_pairs = []
+        for i, j, score in inter_import[:20]:  
+            f1, f2 = features[int(i)], features[int(j)]
+            if f1 in train.columns and f2 in train.columns and f1 in test.columns and f2 in test.columns:
+                top_pairs.append((f1, f2))
+            if len(top_pairs) >= 5: 
+                break
+
+        print("Top interaction pairs:", top_pairs)        
         train, features = feature_engineering(train, y, is_train=True, top_pairs=top_pairs, features=selected_features)
         test, _ = feature_engineering(test, is_train=False, top_pairs=top_pairs, features=selected_features)
     

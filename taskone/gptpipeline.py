@@ -3,18 +3,16 @@ from catboost import CatBoostClassifier, Pool
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 
-CFG = dict(iterations=800, depth=10, lr=0.035, n_sample=10_000_000, n_splits=5)
+CFG = dict(iterations=2733, depth=8, lr=0.03848888585447572, n_sample=10_000_000, n_splits=5)
 COMMON = dict(
     eval_metric="AUC",
     random_seed=42,
     task_type="GPU",
     verbose=100,
     early_stopping_rounds=40,
-    l2_leaf_reg=5,
+    l2_leaf_reg=9.096315897868687,
     boosting_type="Plain",
     bootstrap_type="Bernoulli",
-    subsample=0.7,
-    ctr_border_count=128
 )
 
 def add_frequency_encoding(df, cat_cols):
