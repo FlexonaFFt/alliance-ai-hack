@@ -7,12 +7,16 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import roc_auc_score
 from category_encoders import TargetEncoder
 from eli5.sklearn import PermutationImportance
+from sklearn.preprocessing import LabelEncoder
+import json
 
-best_params = {'iterations': 2500, 'depth': 10, 'learning_rate': 0.03, 'l2_leaf_reg': 5}  
+best_params = {'iterations': 2733, 'depth': 8, 'learning_rate': 0.03848888585447572, 'l2_leaf_reg': 9.096315897868687}  # Placeholder
+
+# Define CFG_LIST without duplicate keys
 CFG_LIST = {
-    "light": dict(**best_params, n_sample=20_000_000, n_splits=5),
-    "mid":   dict(**best_params, iterations=best_params['iterations']+500, depth=best_params['depth']+1, learning_rate=best_params['learning_rate']*0.8, n_sample=20_000_000, n_splits=5),
-    "pro":   dict(**best_params, iterations=best_params['iterations']+1000, depth=best_params['depth']+2, learning_rate=best_params['learning_rate']*0.6, n_sample=20_000_000, n_splits=5)
+    "light": {**best_params, 'n_sample': 20_000_000, 'n_splits': 5},
+    "mid": {**best_params, 'iterations': best_params['iterations'] + 500, 'depth': best_params['depth'] + 1, 'learning_rate': best_params['learning_rate'] * 0.8, 'n_sample': 20_000_000, 'n_splits': 5},
+    "pro": {**best_params, 'iterations': best_params['iterations'] + 1000, 'depth': best_params['depth'] + 2, 'learning_rate': best_params['learning_rate'] * 0.6, 'n_sample': 20_000_000, 'n_splits': 5}
 }
 COMMON = dict(
     eval_metric="AUC",
@@ -27,47 +31,96 @@ BLEND_W = dict(light=0.2, mid=0.4, pro=0.4)
 def feature_engineering(df, y=None, is_train=True, top_pairs=None, features=None):
     if features is None:
         features = [c for c in df.columns if c.startswith('site_') or c.startswith('app_') or c.startswith('device_')]
-
-    # частоты
+    
     for col in features:
         freq = df[col].value_counts(normalize=True)
         df[col + '_freq'] = df[col].map(freq).fillna(0).astype(float)
-
-    # target encoding только на train
+    
     if is_train and y is not None:
         te = TargetEncoder(cols=features, smoothing=1.0)
         df[[col + '_te' for col in features]] = te.fit_transform(df[features], y)
-
-    # взаимодействия
+    
     if top_pairs is None:
         top_pairs = []
     for pair in top_pairs:
-        if pair[0] in df.columns and pair[1] in df.columns: 
-            new_col = f"{pair[0]}_{pair[1]}"
-            df[new_col] = df[pair[0]].astype(str) + '_' + df[pair[1]].astype(str)
-
-    new_features = (
-        [c for c in df.columns if c not in ['id', 'click', 'idx'] and c not in features]
-        + features
-        + [f"{p[0]}_{p[1]}" for p in top_pairs if p[0] in df.columns and p[1] in df.columns]
-    )
+        new_col = f"{pair[0]}_{pair[1]}"
+        df[new_col] = df[pair[0]].astype(str) + '_' + df[pair[1]].astype(str)
+    
+    new_features = [c for c in df.columns if c not in ['id', 'click', 'idx'] and c not in features] + features + [f"{p[0]}_{p[1]}" for p in top_pairs]
     return df, new_features
 
 def select_features(model, X, y, features, threshold=0.01):
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
-    train_pool = Pool(X_train, y_train, cat_features=[c for c in features if not c.endswith('_freq') and not c.endswith('_te')])
-    val_pool = Pool(X_val, y_val, cat_features=[c for c in features if not c.endswith('_freq') and not c.endswith('_te')])
+    cat_features = [c for c in features if not c.endswith('_freq') and not c.endswith('_te')]
+
+    # Убедимся, что категориальные признаки — строки
+    for col in cat_features:
+        X_train[col] = X_train[col].astype(str).fillna('NaN')
+        X_val[col] = X_val[col].astype(str).fillna('NaN')
+
+    # Debug вывод
+    print("Verifying X_val type:", type(X_val))
+    print("X_val columns:", X_val.columns.tolist())
+    print("Feature types in X_val before encoding:")
+    for col in features:
+        try:
+            print(f"{col}: {X_val[col].dtype}")
+        except Exception as e:
+            print(f"Error accessing {col}: {e}")
+
+    print("Features for Pool:", features)
+    print("Categorical features for Pool:", cat_features)
+
+    # Основная модель (с cat_features)
+    train_pool = Pool(X_train, y_train, cat_features=cat_features)
+    val_pool = Pool(X_val, y_val, cat_features=cat_features)
     model.fit(train_pool, eval_set=val_pool, use_best_model=True)
-    perm = PermutationImportance(model, random_state=42, n_iter=5).fit(X_val, y_val)
+
+    # Подготовка данных для numeric-only версии
+    X_train_numeric = X_train[features].copy()
+    X_val_numeric = X_val[features].copy()
+    label_encoders = {}
+
+    for col in cat_features:
+        le = LabelEncoder()
+        combined = pd.concat([X_train[col], X_val[col]], axis=0).astype(str).fillna('NaN')
+        le.fit(combined)
+        X_train_numeric[col] = le.transform(X_train[col])
+        X_val_numeric[col] = le.transform(X_val[col])
+        label_encoders[col] = le
+
+    # В numpy для PermutationImportance
+    X_train_numeric = X_train_numeric.to_numpy()
+    X_val_numeric = X_val_numeric.to_numpy()
+
+    # Numeric CatBoost (без cat_features)
+    model_numeric = CatBoostClassifier(
+        iterations=model.get_param('iterations'),
+        depth=model.get_param('depth'),
+        learning_rate=model.get_param('learning_rate'),
+        l2_leaf_reg=model.get_param('l2_leaf_reg'),
+        **COMMON
+    )
+    model_numeric.fit(X_train_numeric, y_train, eval_set=(X_val_numeric, y_val), use_best_model=True)
+
+    # Permutation Importance
+    perm = PermutationImportance(model_numeric, random_state=42, n_iter=5).fit(X_val_numeric, y_val)
     importances = perm.feature_importances_
+
+    # Отбор признаков
     selected = [features[i] for i in range(len(features)) if importances[i] > threshold]
     print(f"Selected {len(selected)} features out of {len(features)}")
+    print("Selected features:", selected)
+    print("Feature importances:", list(zip(features, importances)))
+
     return selected
 
+
 test = pd.read_csv("ctr_test.csv")
-orig_features = [c for c in test.columns if c not in ['id']]
+orig_features = [c for c in test.columns if c.startswith('site_') or c.startswith('app_') or c.startswith('device_')]
+numeric_features = ['hour', 'C1', 'banner_pos', 'C14', 'C15', 'C16', 'C17', 'C18', 'C19', 'C20', 'C21']
 for col in orig_features:
-    test[col] = test[col].astype(str)
+    test[col] = test[col].astype(str).fillna('NaN')
 
 blend_pred, blend_oof = np.zeros(len(test)), None
 top_pairs = None
@@ -77,7 +130,7 @@ for name, cfg in CFG_LIST.items():
     train = pd.read_csv("ctr_train.csv", nrows=cfg['n_sample'])
     y = train['click'].values
     for col in orig_features:
-        train[col] = train[col].astype(str)
+        train[col] = train[col].astype(str).fillna('NaN')
     
     train, features = feature_engineering(train, y, is_train=True, top_pairs=top_pairs, features=orig_features)
     test, _ = feature_engineering(test, is_train=False, top_pairs=top_pairs, features=orig_features)
@@ -89,35 +142,28 @@ for name, cfg in CFG_LIST.items():
         selected_features = select_features(sub_model, sub_train[features], sub_y, features)
         
         inter_import = sub_model.get_feature_importance(type='Interaction')
-        top_pairs = []
-        for i, j, score in inter_import[:20]:  
-            f1, f2 = features[int(i)], features[int(j)]
-            if f1 in train.columns and f2 in train.columns and f1 in test.columns and f2 in test.columns:
-                top_pairs.append((f1, f2))
-            if len(top_pairs) >= 5: 
-                break
-
-        print("Top interaction pairs:", top_pairs)        
-        train, features = feature_engineering(train, y, is_train=True, top_pairs=top_pairs, features=selected_features)
-        test, _ = feature_engineering(test, is_train=False, top_pairs=top_pairs, features=selected_features)
+        top_pairs = [(features[int(i)], features[int(j)]) for i, j, score in inter_import[:5]]
+        print("Top interaction pairs:", top_pairs)
+        
+        train, features = feature_engineering(train, y, is_train=True, top_pairs=top_pairs, features=orig_features)
+        test, _ = feature_engineering(test, is_train=False, top_pairs=top_pairs, features=orig_features)
+        features = selected_features + [c for c in train.columns if c.endswith('_freq') or c.endswith('_te') or '_' in c]
     
-    features = selected_features + [c for c in train.columns if c.endswith('_freq') or c.endswith('_te') or '_' in c]
-    cat_features = [c for c in features if not c.endswith('_freq') and not c.endswith('_te')]
+    cat_features = [c for c in features if not c.endswith('_freq') and not c.endswith('_te') and c not in numeric_features]
     
     oof, pred = np.zeros(len(train)), np.zeros(len(test))
     skf = StratifiedKFold(n_splits=cfg['n_splits'], shuffle=True, random_state=42)
-    params = dict(
-        iterations=cfg['iterations'],
-        depth=cfg['depth'],
-        learning_rate=cfg['learning_rate'],
-        l2_leaf_reg=cfg['l2_leaf_reg'],
-        **COMMON
-    )
+    params = {k: cfg[k] for k in ['iterations', 'depth', 'learning_rate', 'l2_leaf_reg']}
+    params.update(COMMON)
     
     for fold, (tr_idx, val_idx) in enumerate(skf.split(train, y)):
         X_tr = train.iloc[tr_idx][features]
         X_val = train.iloc[val_idx][features]
         y_tr, y_val = y[tr_idx], y[val_idx]
+        
+        for col in cat_features:
+            X_tr[col] = X_tr[col].astype(str).fillna('NaN')
+            X_val[col] = X_val[col].astype(str).fillna('NaN')
         
         train_pool = Pool(X_tr, y_tr, cat_features=cat_features)
         val_pool = Pool(X_val, y_val, cat_features=cat_features)

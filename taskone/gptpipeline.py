@@ -21,7 +21,7 @@ def add_frequency_encoding(df, cat_cols):
         df[f"{col}_freq"] = df[col].map(freq)
     return df
 
-
+# target encoding (CV)
 def add_target_encoding(train, test, cat_cols, target, n_splits=5):
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     for col in cat_cols:
@@ -35,6 +35,7 @@ def add_target_encoding(train, test, cat_cols, target, n_splits=5):
         test[f"{col}_te"] = test[col].map(global_means)
     return train, test
 
+# генерация парных признаков
 def add_pairwise_interactions(train, test, cat_cols, max_pairs=5):
     from itertools import combinations
     pairs = list(combinations(cat_cols, 2))[:max_pairs]
@@ -70,12 +71,25 @@ new_features = [c for c in train.columns if c not in ['id','click']]
 X, y = train[new_features], train['click'].values
 X_test = test[new_features]
 
-print("\n=== Обучение CatBoost ===")
+print("=== Обучение CatBoost ===")
+interaction_cols = [c for c in train.columns if c.endswith('_int')]
+cat_cols = features + interaction_cols
+
+new_features = [c for c in train.columns if c not in ['id','click']]
+X, y = train[new_features], train['click'].values
+X_test = test[new_features]
+
+cat_idx = [X.columns.get_loc(c) for c in cat_cols if c in X.columns]
+num_like = [c for c in X.columns if c.endswith('_freq') or c.endswith('_te')]
+for c in num_like:
+    X[c] = X[c].astype('float32')
+    X_test[c] = X_test[c].astype('float32')
+
 oof, pred = np.zeros(len(train)), np.zeros(len(test))
 skf = StratifiedKFold(n_splits=CFG['n_splits'], shuffle=True, random_state=42)
 
 for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
-    print(f"\nFOLD {fold}")
+    print(f"FOLD {fold}")
     X_tr, X_val = X.iloc[tr_idx], X.iloc[val_idx]
     y_tr, y_val = y[tr_idx], y[val_idx]
 
@@ -86,17 +100,21 @@ for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
         **COMMON
     )
 
-    model.fit(Pool(X_tr, y_tr), eval_set=Pool(X_val, y_val), use_best_model=True)
+    train_pool = Pool(X_tr, y_tr, cat_features=cat_idx)
+    val_pool   = Pool(X_val, y_val, cat_features=cat_idx)
+    test_pool  = Pool(X_test, cat_features=cat_idx)
 
-    oof[val_idx] = model.predict_proba(X_val)[:, 1]
-    pred += model.predict_proba(X_test)[:, 1] / CFG['n_splits']
+    model.fit(train_pool, eval_set=val_pool, use_best_model=True)
+
+    oof[val_idx] = model.predict_proba(val_pool)[:, 1]
+    pred += model.predict_proba(test_pool)[:, 1] / CFG['n_splits']
 
     os.makedirs("models", exist_ok=True)
     model.save_model(f"models/pro_adv_fold{fold}.cbm")
     del model; gc.collect()
 
 cv_auc = roc_auc_score(y, oof)
-print(f"\nCV AUC (freq + target encoding + pairwise): {cv_auc:.6f}")
+print(f"CV AUC (freq + target encoding + pairwise): {cv_auc:.6f}")
 
 sub['click'] = pred
 sub.to_csv("submission_pro_adv.csv", index=False)
