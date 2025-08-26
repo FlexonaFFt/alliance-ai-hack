@@ -3,7 +3,7 @@ from catboost import CatBoostClassifier, Pool
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 
-CFG = dict(iterations=2733, depth=8, lr=0.03848888585447572, n_sample=10_000_000, n_splits=5)
+CFG = dict(iterations=1500, depth=8, lr=0.03848888585447572, n_sample=5_000_000, n_splits=5)
 COMMON = dict(
     eval_metric="AUC",
     random_seed=42,
@@ -81,6 +81,8 @@ X_test = test[new_features]
 
 cat_idx = [X.columns.get_loc(c) for c in cat_cols if c in X.columns]
 num_like = [c for c in X.columns if c.endswith('_freq') or c.endswith('_te')]
+X = X.copy()
+X_test = X_test.copy()
 for c in num_like:
     X[c] = X[c].astype('float32')
     X_test[c] = X_test[c].astype('float32')
