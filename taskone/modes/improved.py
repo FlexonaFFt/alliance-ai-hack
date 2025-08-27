@@ -49,6 +49,7 @@ class FeatureEngineer:
         self.freq_maps = {}
         self.target_maps = {}
         self.label_encoders = {}
+        self.le_dict = {}  # Новый словарь для сопоставлений
     
     def fit(self, df: pd.DataFrame):
         print("Обучение маппингов для кодирования признаков...")
@@ -71,6 +72,7 @@ class FeatureEngineer:
             le = LabelEncoder()
             le.fit(df[col].astype(str).fillna("__NA__"))
             self.label_encoders[col] = le
+            self.le_dict[col] = dict(zip(le.classes_, le.transform(le.classes_)))  # Создаем словарь
         
         print("Маппинги для кодирования признаков обучены.")
     
@@ -90,8 +92,8 @@ class FeatureEngineer:
                     df[f"{col}_te"] = df[col].map(self.target_maps[col]).fillna(0)
         
         for col in self.cfg.features:
-            if col in df.columns and col in self.label_encoders:
-                df[f"{col}_le"] = self.label_encoders[col].transform(df[col].astype(str).fillna("__NA__"))
+            if col in df.columns and col in self.le_dict:
+                df[f"{col}_le"] = df[col].map(self.le_dict[col]).fillna(-1)  # Обработка неизвестных значений
         
         print(f"Данные преобразованы. Новая размерность: {df.shape}")
         return df

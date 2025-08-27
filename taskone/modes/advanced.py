@@ -18,7 +18,7 @@ class CTRConfig:
         self.target = "click"
         
         self.CFG_LIST = {
-            "light": dict(iterations=700, depth=7,  lr=0.04,  n_sample=2_000_000,  n_splits=3),
+            "light": dict(iterations=700, depth=7,  lr=0.04,  n_sample=5_000_000,  n_splits=3),
             "mid":   dict(iterations=1000, depth=8,  lr=0.03,  n_sample=6_000_000, n_splits=5),
             "pro":   dict(iterations=3000, depth=9, lr=0.025, n_sample=6_000_000, n_splits=5)
         }
@@ -60,6 +60,7 @@ class FeatureEngineer:
         self.freq_maps = {}
         self.target_maps = {}
         self.label_encoders = {}
+        self.le_dict = {}  # Новый словарь для сопоставлений
         self.interaction_features = []
         self.interaction_freq_maps = {}
     
@@ -85,6 +86,7 @@ class FeatureEngineer:
             le = LabelEncoder()
             le.fit(df[col].astype(str).fillna("__NA__"))
             self.label_encoders[col] = le
+            self.le_dict[col] = dict(zip(le.classes_, le.transform(le.classes_)))  # Создаем словарь
         
         self._create_interactions(df, y)
         
@@ -152,8 +154,8 @@ class FeatureEngineer:
                     df[f"{col}_te"] = df[col].map(self.target_maps[col]).fillna(0)
         
         for col in self.cfg.features:
-            if col in df.columns and col in self.label_encoders:
-                df[f"{col}_le"] = self.label_encoders[col].transform(df[col].astype(str).fillna("__NA__"))
+            if col in df.columns and col in self.le_dict:
+                df[f"{col}_le"] = df[col].map(self.le_dict[col]).fillna(-1)  # Обработка неизвестных значений
         
         for feature in self.interaction_features:
             if "_concat" in feature:
