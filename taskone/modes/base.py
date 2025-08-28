@@ -105,17 +105,21 @@ class CTRTrainer:
         print("submission_blend.csv сохранён.")
 
 CFG_LIST = {
-    "light": dict(iterations=300, depth=6,  lr=0.08,  n_sample=20_000_000,  n_splits=3), 
-    "mid":   dict(iterations=600, depth=8,  lr=0.05,  n_sample=20_000_000, n_splits=5),
-    "pro":   dict(iterations=1500, depth=12, lr=0.02,  n_sample=20_000_000, n_splits=7)
+    "light": dict(iterations=500, depth=6,  lr=0.08,  n_sample=20_000_000,  n_splits=3), 
+    "mid":   dict(iterations=800, depth=8,  lr=0.04,  n_sample=20_000_000, n_splits=5),
+    "pro":   dict(iterations=2000, depth=10, lr=0.01,  n_sample=20_000_000, n_splits=7)
 }
 COMMON = dict(
     eval_metric="AUC",
     random_seed=42,
     task_type="GPU",     
     verbose=100,
-    early_stopping_rounds=100,
-    grow_policy="SymmetricTree"
+    early_stopping_rounds=150,
+    grow_policy="SymmetricTree",
+    boosting_type="Ordered",  # Новый: ordered boosting для лучшей производительности
+    l2_leaf_reg=5,  # Новый: усиленная регуляризация
+    bagging_temperature=0.5,  # Новый: для разнообразия
+    scale_pos_weight=10  # Новый: пример для дисбаланса; рассчитайте как len(negative)/len(positive)
 )
 BLEND_W = dict(light=0.2, mid=0.3, pro=0.5)
 trainer = CTRTrainer(CFG_LIST, COMMON, BLEND_W, "ctr_train.csv", "ctr_test.csv", "ctr_sample_submission.csv")
