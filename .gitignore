@@ -10,4 +10,8 @@ taskone/ctr_train
 taskone/ctr_test
 taskone/ctr_sample_submission
 
+tasktwo/data/images.gz
+tasktwo/data/test.tar.gz 
+tasktwo/data/train.tar.gz
+
 myenv
