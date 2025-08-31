@@ -11,10 +11,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
 from tqdm import tqdm
 from sklearn.utils.class_weight import compute_class_weight
+from torchvision.models import ConvNeXt_Tiny_Weights
 
+pretrained = True
 train_dir = 'train_folder/train'
 test_dir = 'test_folder/test'
-label_map_path = '_classes.csv'
+label_map_path = 'train_folder/train/_classes.csv'
 sample_submission_path = 'animals_sample.csv'
 
 label_map_df = pd.read_csv(label_map_path)
@@ -23,6 +25,8 @@ label_map = {'Bear': 0, 'Bird': 1, 'Cat': 2, 'Dog': 3, 'Leopard': 4, 'Otter': 5}
 label_map_df['label'] = label_map_df[['Bear', 'Bird', 'Cat', 'Dog', 'Leopard', 'Otter']].idxmax(axis=1)
 label_map_df['label'] = label_map_df['label'].map(label_map)
 
+if pretrained: settings = ConvNeXt_Tiny_Weights.IMAGENET1K_V1
+else: settings = None
 
 strong_aug = transforms.Compose([
     transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
@@ -30,11 +34,10 @@ strong_aug = transforms.Compose([
     transforms.RandomVerticalFlip(),
     transforms.ColorJitter(0.3, 0.3, 0.3, 0.2),
     transforms.RandomGrayscale(p=0.2),
-    transforms.ToTensor(),  
+    transforms.ToTensor(),
     transforms.RandomErasing(p=0.3),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
-
 
 medium_aug = transforms.Compose([
     transforms.RandomResizedCrop(224),
@@ -43,7 +46,6 @@ medium_aug = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
-
 
 light_aug = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -91,13 +93,18 @@ train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = models.resnet50(pretrained=True)
-model.fc = nn.Linear(model.fc.in_features, 6)
+model = models.convnext_tiny(weights=settings)
+model.classifier[2] = nn.Linear(model.classifier[2].in_features, 6)
 model = model.to(device)
+
+if os.path.exists("best_model.pth"):
+    print("Loading saved model...")
+    model.load_state_dict(torch.load("best_model.pth", map_location=device))
 
 class_weights = compute_class_weight('balanced', classes=np.arange(6), y=label_map_df['label'])
 class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
 criterion = nn.CrossEntropyLoss(weight=class_weights)
+
 def train_phase(model, train_loader, val_loader, optimizer, scheduler, epochs, phase_name=""):
     best_f1 = 0
     for epoch in range(epochs):
@@ -131,14 +138,16 @@ def train_phase(model, train_loader, val_loader, optimizer, scheduler, epochs, p
         if scheduler:
             scheduler.step()
 
+# Phase 1
 for param in model.parameters():
     param.requires_grad = False
-for param in model.fc.parameters():
+for param in model.classifier.parameters():
     param.requires_grad = True
 
-optimizer = torch.optim.Adam(model.fc.parameters(), lr=1e-3, weight_decay=1e-4)
+optimizer = torch.optim.Adam(model.classifier.parameters(), lr=1e-3, weight_decay=1e-4)
 train_phase(model, train_loader, val_loader, optimizer, scheduler=None, epochs=5, phase_name="Phase1")
 
+# Phase 2
 train_dataset.transform = medium_aug
 train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler)
 
@@ -149,40 +158,27 @@ optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
 train_phase(model, train_loader, val_loader, optimizer, scheduler, epochs=15, phase_name="Phase2")
 
+# Phase 3
 train_dataset.transform = light_aug
 train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler)
-
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-5, weight_decay=1e-5)
 train_phase(model, train_loader, val_loader, optimizer, scheduler=None, epochs=5, phase_name="Phase3")
+
 model.load_state_dict(torch.load("best_model.pth"))
 model.eval()
-
-tta_transforms = [
-    transforms.Compose([
-        transforms.Resize((224,224)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
-    ]),
-    transforms.Compose([
-        transforms.Resize((224,224)),
-        transforms.RandomHorizontalFlip(p=1.0),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
-    ])
-]
 
 test_df = pd.read_csv(sample_submission_path)
 test_dataset = AnimalDataset(test_df, test_dir, transform=light_aug, is_test=True)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
 all_preds = []
 with torch.no_grad():
-    for images, _ in tqdm(test_loader, desc="Testing TTA"):
+    for images, _ in tqdm(test_loader, desc="Testing"):
         images = images.to(device)
         outputs = model(images)
         all_preds.append(outputs.softmax(1).cpu().numpy())
 
-
-all_preds = np.vstack(all_preds)  
+all_preds = np.vstack(all_preds)
 final_preds = np.argmax(all_preds, axis=1)
 submission = pd.DataFrame({
     'idx': range(1, len(final_preds)+1),

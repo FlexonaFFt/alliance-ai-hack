@@ -5,16 +5,20 @@ from PIL import Image
 
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
 from tqdm import tqdm
-import timm  
+import timm
+
+from timm.data import Mixup
+from torch.cuda.amp import autocast, GradScaler
 
 train_dir = "train_folder/train"
 test_dir = "test_folder/test"
-label_map_path = "_classes.csv"
+label_map_path = "train_folder/train/_classes.csv"
 sample_submission_path = "animals_sample.csv"
 output_dir = "submissions"
 os.makedirs(output_dir, exist_ok=True)
@@ -79,54 +83,69 @@ sampler = WeightedRandomSampler(samples_weight, num_samples=len(samples_weight),
 
 train_dataset = AnimalDataset(train_df, train_dir, transform=train_aug)
 val_dataset = AnimalDataset(val_df, train_dir, transform=val_aug)
-
 train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2, weight=None):
-        super().__init__()
-        self.gamma = gamma
-        self.weight = weight
-
-    def forward(self, input, target):
-        ce_loss = nn.CrossEntropyLoss(weight=self.weight)(input, target)
-        pt = torch.exp(-ce_loss)
-        return ((1-pt)**self.gamma * ce_loss).mean()
-
-def mixup_data(x, y, alpha=0.4):
-    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(x.device)
-    mixed_x = lam * x + (1 - lam) * x[index,:]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1-lam) * criterion(pred, y_b)
+criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+mixup_fn = Mixup(
+    mixup_alpha=0.4,
+    cutmix_alpha=1.0,
+    label_smoothing=0.05,
+    num_classes=6
+)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 def train_model(model, train_loader, val_loader, epochs, lr, model_name):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    criterion = FocalLoss().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
 
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        epochs=epochs,
+        steps_per_epoch=len(train_loader)
+    )
+
+    scaler = GradScaler()
     best_f1 = 0
+
+    freeze_epochs = 3
+    for name, param in model.named_parameters():
+        if "head" not in name:
+            param.requires_grad = False
+
     for epoch in range(epochs):
         model.train()
-        running_loss = 0
+        running_loss = 0.0
+
+        # Разморозка
+        if epoch == freeze_epochs:
+            for param in model.parameters():
+                param.requires_grad = True
+            optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+            scheduler = optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=lr,
+                epochs=epochs-epoch,
+                steps_per_epoch=len(train_loader)
+            )
+            print("🔓 Backbone unfrozen!")
+
         for images, labels in tqdm(train_loader, desc=f"{model_name} Epoch {epoch+1}/{epochs}"):
             images, labels = images.to(device), labels.to(device)
-            images, targets_a, targets_b, lam = mixup_data(images, labels)
+
+            if mixup_fn is not None:
+                images, labels = mixup_fn(images, labels)
 
             optimizer.zero_grad()
-            outputs = model(images)
-            loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
-            optimizer.step()
+            with autocast():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
             running_loss += loss.item()
+            scheduler.step()
 
         model.eval()
         val_preds, val_labels = [], []
@@ -134,7 +153,7 @@ def train_model(model, train_loader, val_loader, epochs, lr, model_name):
             for images, labels in val_loader:
                 images, labels = images.to(device), labels.to(device)
                 outputs = model(images)
-                _, predicted = torch.max(outputs,1)
+                _, predicted = torch.max(outputs, 1)
                 val_preds.extend(predicted.cpu().numpy())
                 val_labels.extend(labels.cpu().numpy())
 
@@ -146,13 +165,11 @@ def train_model(model, train_loader, val_loader, epochs, lr, model_name):
             torch.save(model.state_dict(), f"{model_name}_best.pth")
             print("✅ Saved best model!")
 
-        scheduler.step()
-
     return model
 
-model_name = "efficientnet_b3"
-model = timm.create_model(model_name, pretrained=True, num_classes=6).to(device)
 
+model_name = "convnext_tiny"
+model = timm.create_model(model_name, pretrained=True, num_classes=6).to(device)
 model = train_model(model, train_loader, val_loader, epochs=20, lr=1e-4, model_name=model_name)
 tta_transforms = [
     val_aug,
@@ -160,6 +177,13 @@ tta_transforms = [
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.RandomHorizontalFlip(p=1.0),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],
+                             [0.229,0.224,0.225])
+    ]),
+    transforms.Compose([
+        transforms.Resize(288),
+        transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize([0.485,0.456,0.406],
                              [0.229,0.224,0.225])
