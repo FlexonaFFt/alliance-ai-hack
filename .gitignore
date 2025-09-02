@@ -20,4 +20,12 @@ tasktwo/data/train
 tasktwo/data/train_folder
 tasktwo/data/test_folder
 
+tasktwo_/data/images.gz
+tasktwo_/data/test.tar.gz
+tasktwo_/data/train.tar.gz
+tasktwo_/data/test
+tasktwo_/data/train
+tasktwo_/data/train_folder
+tasktwo_/data/test_folder
+
 myenv
