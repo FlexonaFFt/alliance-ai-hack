@@ -58,29 +58,24 @@ class AnimalDataset(Dataset):
         label = self.df.iloc[idx]['label']
         return image, label
 
+
+
 train_aug = A.Compose([
-    A.RandomResizedCrop(224, 224, scale=(0.6, 1.0), ratio=(0.75, 1.33), p=1.0),
+    A.Resize(height=256, width=256),
+    A.RandomCrop(height=224, width=224),  # Замена RandomResizedCrop
     A.HorizontalFlip(p=0.5),
     A.VerticalFlip(p=0.5),
     A.RandomRotate90(p=0.5),
-
-    A.RandomBrightnessContrast(0.3, 0.3, p=0.5),
-    A.HueSaturationValue(10, 15, 10, p=0.3),
-
+    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
+    A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=10, p=0.3),
     A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-    A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
-
-    A.Cutout(num_holes=4, max_h_size=30, max_w_size=30, fill_value=0, p=0.5),
-    A.ElasticTransform(alpha=50, sigma=5, alpha_affine=20, p=0.3),
-
-    A.Normalize(mean=(0.485, 0.456, 0.406),
-                std=(0.229, 0.224, 0.225)),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ToTensorV2()
 ])
 
 val_aug = A.Compose([
-    A.Resize(256, 256),
-    A.CenterCrop(224, 224),
+    A.Resize(height=256, width=256),
+    A.CenterCrop(height=224, width=224),
     A.Normalize(mean=(0.485, 0.456, 0.406),
                 std=(0.229, 0.224, 0.225)),
     ToTensorV2()
@@ -159,8 +154,8 @@ val_dataset_rgb = AnimalDataset(val_df, train_dir, transform=val_aug, use_gray=F
 train_loader_rgb = DataLoader(train_dataset_rgb, batch_size=32, sampler=sampler)
 val_loader_rgb = DataLoader(val_dataset_rgb, batch_size=32, shuffle=False)
 
-model_rgb = timm.create_model("convnext_tiny", pretrained=True, num_classes=6).to(device)
-model_rgb = train_model(model_rgb, train_loader_rgb, val_loader_rgb, epochs=20, lr=1e-4, model_name="convnext_rgb")
+model_rgb = timm.create_model("swin_tiny_patch4_window7_224", pretrained=True, num_classes=6).to(device)
+model_rgb = train_model(model_rgb, train_loader_rgb, val_loader_rgb, epochs=20, lr=1e-4, model_name="swin_rgb")
 
 # GRAY модель
 train_dataset_gray = AnimalDataset(train_df, train_dir, transform=train_aug, use_gray=True)
@@ -169,8 +164,8 @@ val_dataset_gray = AnimalDataset(val_df, train_dir, transform=val_aug, use_gray=
 train_loader_gray = DataLoader(train_dataset_gray, batch_size=32, sampler=sampler)
 val_loader_gray = DataLoader(val_dataset_gray, batch_size=32, shuffle=False)
 
-model_gray = timm.create_model("convnext_tiny", pretrained=True, num_classes=6).to(device)
-model_gray = train_model(model_gray, train_loader_gray, val_loader_gray, epochs=20, lr=1e-4, model_name="convnext_gray")
+model_gray = timm.create_model("swin_tiny_patch4_window7_224", pretrained=True, num_classes=6).to(device)
+model_gray = train_model(model_gray, train_loader_gray, val_loader_gray, epochs=20, lr=1e-4, model_name="swin_gray")
 
 test_df = pd.read_csv(sample_submission_path)
 test_dataset_rgb = AnimalDataset(test_df, test_dir, transform=val_aug, is_test=True, use_gray=False)
@@ -179,8 +174,8 @@ test_dataset_gray = AnimalDataset(test_df, test_dir, transform=val_aug, is_test=
 test_loader_rgb = DataLoader(test_dataset_rgb, batch_size=32, shuffle=False)
 test_loader_gray = DataLoader(test_dataset_gray, batch_size=32, shuffle=False)
 
-model_rgb.load_state_dict(torch.load("convnext_rgb_best.pth"))
-model_gray.load_state_dict(torch.load("convnext_gray_best.pth"))
+model_rgb.load_state_dict(torch.load("swin_rgb_best.pth"))
+model_gray.load_state_dict(torch.load("swin_gray_best.pth"))
 
 model_rgb.eval()
 model_gray.eval()
@@ -208,7 +203,6 @@ sub_df = pd.DataFrame({
     "label": final_preds
 })
 
-sub_path = os.path.join(output_dir, "convnext_rgb_gray_ensemble.csv")
+sub_path = os.path.join(output_dir, "swin_rgb_gray_ensemble.csv")
 sub_df.to_csv(sub_path, index=False)
 print(f"✅ Saved submission: {sub_path}")
-

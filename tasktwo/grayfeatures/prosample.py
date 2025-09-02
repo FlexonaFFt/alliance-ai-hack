@@ -1,25 +1,50 @@
 import os
-import random
 import math
+import random
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import List, Tuple, Optional
 
+import cv2
+import timm
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageOps
-
-import torch
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from torchvision.transforms import functional as TF
-
-import timm
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import f1_score
 
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.cuda.amp import autocast, GradScaler
 
-def seed_everything(seed: int = 42):
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+class Config:
+    train_dir = "train_folder/train"
+    test_dir = "test_folder/test"
+    label_map_path = "train_folder/train/_classes.csv"
+    sample_submission_path = "animals_sample.csv"
+    output_dir = "submissions"
+
+    backbone = "convnext_tiny"
+    num_classes = 6
+    img_size = 224
+    quant_levels = 50
+
+    n_splits = 5
+    epochs = 35
+    batch_size = 32
+    num_workers = 4
+    lr = 1e-3
+    weight_decay = 1e-4
+    seed = 42
+    use_amp = True
+    tta_n = 8
+    class_names = ["Bear", "Bird", "Cat", "Dog", "Leopard", "Otter"]
+    class_to_idx = {c: i for i, c in enumerate(class_names)}
+
+
+def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -28,283 +53,332 @@ def seed_everything(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
+def quantize_gray(img_gray_uint8: np.ndarray, levels: int) -> np.ndarray:
+    arr = img_gray_uint8.astype(np.float32) / 255.0
+    arr_q = np.floor(arr * (levels - 1)) / (levels - 1)
+    out = (arr_q * 255.0).astype(np.uint8)
+    return out
+
+
+def get_train_transforms(cfg: Config):
+    s = cfg.img_size
+    return A.Compose([
+        A.ToGray(p=1.0),
+        A.RandomResizedCrop(height=s, width=s, scale=(0.7, 1.0), ratio=(0.8, 1.2), interpolation=cv2.INTER_CUBIC),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.Rotate(limit=25, interpolation=cv2.INTER_CUBIC, border_mode=cv2.BORDER_REFLECT_101, p=0.8),
+        A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05, p=0.7),
+        A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.5),
+        A.GaussianBlur(blur_limit=(3, 5), sigma_limit=(0.1, 2.0), p=0.4),
+        A.Normalize(mean=(0.5,), std=(0.5,)),
+        ToTensorV2()
+    ])
+
+
+def get_valid_transforms(cfg: Config):
+    s = cfg.img_size
+    return A.Compose([
+        A.ToGray(p=1.0),
+        A.Resize(height=s, width=s, interpolation=cv2.INTER_CUBIC),
+        A.Normalize(mean=(0.5,), std=(0.5,)),
+        ToTensorV2()
+    ])
+
+
+def get_tta_transforms(cfg: Config) -> List[A.Compose]:
+    s = cfg.img_size
+    base = [
+        A.ToGray(p=1.0),
+        A.Resize(height=s, width=s, interpolation=cv2.INTER_CUBIC),
+        A.Normalize(mean=(0.5,), std=(0.5,)),
+        ToTensorV2(),
+    ]
+    tta_list = []
+    tta_list.append(A.Compose(base))
+    tta_list.append(A.Compose([A.HorizontalFlip(p=1.0)] + base))
+    tta_list.append(A.Compose([A.VerticalFlip(p=1.0)] + base))
+    tta_list.append(A.Compose([A.HorizontalFlip(p=1.0), A.VerticalFlip(p=1.0)] + base))
+    for deg in [-20, -10, 10, 20]:
+        tta_list.append(A.Compose([A.Rotate(limit=(deg, deg), interpolation=cv2.INTER_CUBIC, border_mode=cv2.BORDER_REFLECT_101, p=1.0)] + base))
+    return tta_list
+
+
 class TracksDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, img_dir: str, mode: str = 'train',
-                 transform=None, quantize_levels: int = 50):
+    def __init__(self, df: pd.DataFrame, img_dir: str, cfg: Config, mode: str = "train"):
         self.df = df.reset_index(drop=True)
         self.img_dir = img_dir
+        self.cfg = cfg
         self.mode = mode
-        self.transform = transform
-        self.quantize_levels = quantize_levels
+        self.train_tf = get_train_transforms(cfg)
+        self.val_tf = get_valid_transforms(cfg)
 
     def __len__(self):
         return len(self.df)
 
-    def quantize(self, img: Image.Image) -> Image.Image:
-        arr = np.array(img).astype(np.float32) / 255.0
-        arr_q = np.floor(arr * (self.quantize_levels - 1)) / (self.quantize_levels - 1)
-        arr_q = (arr_q * 255.0).astype(np.uint8)
-        return Image.fromarray(arr_q, mode='L')
-
     def __getitem__(self, idx: int):
-        row = self.df.loc[idx]
-        img_path = os.path.join(self.img_dir, row['filename'])
-        img = Image.open(img_path).convert('L')
-        img = self.quantize(img)
+        row = self.df.iloc[idx]
+        fname = row["filename"]
+        label = row.get("label", None)
+        path = os.path.join(self.img_dir, fname)
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"Image not found: {path}")
+        img = quantize_gray(img, self.cfg.quant_levels)
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
 
-        if self.transform:
-            img = self.transform(img)
+        if self.mode == "train":
+            aug = self.train_tf(image=img)
         else:
-            img = TF.to_tensor(img)
+            aug = self.val_tf(image=img)
+        tensor = aug["image"]
 
-        if self.mode == 'test':
-            return img, row['id'] if 'id' in row else row['filename']
-        return img, int(row['label'])
-
-
-def get_train_transforms(size: int = 224):
-    return transforms.Compose([
-        transforms.RandomResizedCrop(size, scale=(0.6, 1.0), interpolation=Image.BICUBIC),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.2),
-        transforms.RandomRotation(degrees=30, resample=Image.BICUBIC),
-        transforms.ColorJitter(brightness=0.3, contrast=0.3),
-        transforms.GaussianBlur(kernel_size=3),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.25]),
-        transforms.RandomErasing(p=0.2, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0.0)
-    ])
+        if label is None or self.mode == "test":
+            return tensor, fname
+        return tensor, int(label)
 
 
-def get_val_transforms(size: int = 224):
-    return transforms.Compose([
-        transforms.Resize((size, size), interpolation=Image.BICUBIC),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.25])
-    ])
-
-
-class ConvNextTinyWrapper(nn.Module):
-    def __init__(self, num_classes: int = 6, pretrained: bool = True, in_chans: int = 1):
-        super().__init__()
-        self.model = timm.create_model('convnext_tiny', pretrained=pretrained, num_classes=num_classes, in_chans=in_chans)
-
-    def forward(self, x):
-        return self.model(x)
-
-
-class LabelSmoothingCrossEntropy(nn.Module):
-    def __init__(self, smoothing: float = 0.1):
-        super().__init__()
-        self.smoothing = smoothing
-
-    def forward(self, preds, target):
-        log_prob = torch.nn.functional.log_softmax(preds, dim=-1)
-        nll = -log_prob.gather(dim=-1, index=target.unsqueeze(1)).squeeze(1)
-        smooth_loss = -log_prob.mean(dim=-1)
-        loss = (1.0 - self.smoothing) * nll + self.smoothing * smooth_loss
-        return loss.mean()
-
-
-class Trainer:
-    def __init__(self,
-                 model: nn.Module,
-                 device: torch.device,
-                 output_dir: str = 'outputs',
-                 model_name: str = 'convnext_tiny'):
-        self.model = model.to(device)
-        self.device = device
-        self.output_dir = output_dir
-        self.model_name = model_name
-        os.makedirs(output_dir, exist_ok=True)
-
-    def train_fold(self, train_df: pd.DataFrame, val_df: pd.DataFrame, img_dir: str,
-                   epochs: int = 20, batch_size: int = 32, lr: float = 1e-3,
-                   weight_decay: float = 1e-4, num_workers: int = 4):
-
-        train_ds = TracksDataset(train_df, img_dir, mode='train', transform=get_train_transforms())
-        val_ds = TracksDataset(val_df, img_dir, mode='val', transform=get_val_transforms())
-
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        criterion = LabelSmoothingCrossEntropy(smoothing=0.05)
-
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr,
-                                                        steps_per_epoch=len(train_loader), epochs=epochs)
-
-        best_f1 = 0.0
-        best_path = None
-
-        for epoch in range(epochs):
-            self.model.train()
-            train_losses = []
-            all_preds = []
-            all_targets = []
-
-            for imgs, targets in train_loader:
-                imgs = imgs.to(self.device)
-                targets = targets.to(self.device)
-
-                logits = self.model(imgs)
-                loss = criterion(logits, targets)
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-
-                train_losses.append(loss.item())
-                preds = torch.argmax(logits, dim=1).detach().cpu().numpy()
-                all_preds.extend(preds.tolist())
-                all_targets.extend(targets.detach().cpu().numpy().tolist())
-
-            train_f1 = f1_score(all_targets, all_preds, average='macro')
-
-            val_f1, val_loss = self.validate(val_loader, criterion)
-
-            print(f"Epoch {epoch+1}/{epochs} — train_loss={np.mean(train_losses):.4f}, train_f1={train_f1:.4f} | val_loss={val_loss:.4f}, val_f1={val_f1:.4f}")
-
-            if val_f1 > best_f1:
-                best_f1 = val_f1
-                best_path = os.path.join(self.output_dir, f'best_model_f1_{best_f1:.4f}.pth')
-                torch.save(self.model.state_dict(), best_path)
-
-        return best_f1, best_path
-
-    def validate(self, val_loader: DataLoader, criterion):
-        self.model.eval()
-        losses = []
-        all_preds = []
-        all_targets = []
-        with torch.no_grad():
-            for imgs, targets in val_loader:
-                imgs = imgs.to(self.device)
-                targets = targets.to(self.device)
-                logits = self.model(imgs)
-                loss = criterion(logits, targets)
-                losses.append(loss.item())
-                preds = torch.argmax(logits, dim=1).detach().cpu().numpy()
-                all_preds.extend(preds.tolist())
-                all_targets.extend(targets.detach().cpu().numpy().tolist())
-        val_f1 = f1_score(all_targets, all_preds, average='macro')
-        return val_f1, np.mean(losses)
-
-    def predict_tta(self, img_paths: List[str], tta_transforms: List[transforms.Compose], batch_size: int = 32):
-        self.model.eval()
-        probs_sum = None
-        for t in tta_transforms:
-            ds = TestDataset(img_paths, transform=t)
-            dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
-            preds_list = []
-            with torch.no_grad():
-                for imgs in dl:
-                    imgs = imgs.to(self.device)
-                    logits = self.model(imgs)
-                    probs = torch.softmax(logits, dim=1).cpu().numpy()
-                    preds_list.append(probs)
-            probs_full = np.vstack(preds_list)
-            if probs_sum is None:
-                probs_sum = probs_full
-            else:
-                probs_sum += probs_full
-        probs_avg = probs_sum / len(tta_transforms)
-        return probs_avg
-
-
-class TestDataset(Dataset):
-    def __init__(self, img_paths: List[str], transform=None):
+class TestImages(Dataset):
+    def __init__(self, img_paths: List[str], cfg: Config, tta_tf: Optional[A.Compose] = None):
         self.img_paths = img_paths
-        self.transform = transform
+        self.cfg = cfg
+        self.tf = tta_tf if tta_tf is not None else get_valid_transforms(cfg)
 
     def __len__(self):
         return len(self.img_paths)
 
     def __getitem__(self, idx):
-        p = self.img_paths[idx]
-        img = Image.open(p).convert('L')
-        arr = np.array(img).astype(np.float32) / 255.0
-        arr_q = np.floor(arr * 49) / 49.0
-        img_q = Image.fromarray((arr_q * 255).astype(np.uint8), mode='L')
-        if self.transform:
-            img = self.transform(img_q)
+        path = self.img_paths[idx]
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"Image not found: {path}")
+        img = quantize_gray(img, self.cfg.quant_levels)
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        aug = self.tf(image=img)
+        return aug["image"], os.path.basename(path)
+
+
+class Classifier(nn.Module):
+    def __init__(self, backbone: str, num_classes: int, in_chans: int = 1, pretrained: bool = True):
+        super().__init__()
+        if backbone == "convnext_tiny":
+            self.model = timm.create_model("convnext_tiny", pretrained=pretrained, num_classes=num_classes, in_chans=in_chans)
+        elif backbone == "swin_tiny":
+            self.model = timm.create_model("swin_tiny_patch4_window7_224", pretrained=pretrained, num_classes=num_classes, in_chans=in_chans)
         else:
-            img = TF.to_tensor(img_q)
-        return img
+            raise ValueError(f"Unknown backbone: {backbone}")
+
+    def forward(self, x):
+        return self.model(x)
 
 
-def run_training_kfold(train_dir: str,
-                       label_map_path: str,
-                       out_dir: str = 'submissions',
-                       n_splits: int = 5,
-                       epochs: int = 20,
-                       batch_size: int = 32,
-                       lr: float = 1e-3,
-                       seed: int = 42):
+class Trainer:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        os.makedirs(cfg.output_dir, exist_ok=True)
 
-    seed_everything(seed)
-    df_map = pd.read_csv(label_map_path)
-    class_cols = ['Bear', 'Bird', 'Cat', 'Wolf', 'Leopard', 'Otter']
-    if set(class_cols).issubset(df_map.columns):
-        df_map['label'] = df_map[class_cols].idxmax(axis=1).map({c: i for i, c in enumerate(class_cols)})
-    elif 'label' in df_map.columns:
-        pass
+    def _make_model(self):
+        model = Classifier(self.cfg.backbone, self.cfg.num_classes, in_chans=1, pretrained=True)
+        return model.to(self.device)
+
+    def _make_loaders(self, train_df: pd.DataFrame, val_df: pd.DataFrame) -> Tuple[DataLoader, DataLoader]:
+        ds_train = TracksDataset(train_df, self.cfg.train_dir, self.cfg, mode="train")
+        ds_val = TracksDataset(val_df, self.cfg.train_dir, self.cfg, mode="val")
+
+        counts = train_df["label"].value_counts().to_dict()
+        weights = [1.0 / counts[int(l)] for l in train_df["label"].tolist()]
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+        dl_train = DataLoader(ds_train, batch_size=self.cfg.batch_size, sampler=sampler,
+                              num_workers=self.cfg.num_workers, pin_memory=True)
+        dl_val = DataLoader(ds_val, batch_size=self.cfg.batch_size, shuffle=False,
+                            num_workers=self.cfg.num_workers, pin_memory=True)
+        return dl_train, dl_val
+
+    def _build_optim(self, model: nn.Module):
+        optimizer = torch.optim.AdamW(model.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.cfg.epochs)
+        return optimizer, scheduler
+
+    def _validate(self, model: nn.Module, loader: DataLoader, criterion) -> Tuple[float, float]:
+        model.eval()
+        losses = []
+        gts, prs = [], []
+        with torch.no_grad():
+            for imgs, labels in loader:
+                imgs = imgs.to(self.device)
+                labels = labels.to(self.device)
+                with autocast(enabled=self.cfg.use_amp):
+                    logits = model(imgs)
+                    loss = criterion(logits, labels)
+                losses.append(loss.item())
+                preds = torch.argmax(logits, dim=1).detach().cpu().numpy()
+                prs.extend(preds.tolist())
+                gts.extend(labels.detach().cpu().numpy().tolist())
+        f1 = f1_score(gts, prs, average="macro")
+        return f1, float(np.mean(losses))
+
+    def train_fold(self, fold: int, train_df: pd.DataFrame, val_df: pd.DataFrame) -> Tuple[float, str]:
+        model = self._make_model()
+        optimizer, scheduler = self._build_optim(model)
+        criterion = nn.CrossEntropyLoss()
+        scaler = GradScaler(enabled=self.cfg.use_amp)
+
+        dl_train, dl_val = self._make_loaders(train_df, val_df)
+
+        best_f1 = 0.0
+        best_path = os.path.join(self.cfg.output_dir, f"{self.cfg.backbone}_fold{fold}_best.pth")
+
+        for epoch in range(self.cfg.epochs):
+            model.train()
+            epoch_losses = []
+            gts, prs = [], []
+
+            for imgs, labels in dl_train:
+                imgs = imgs.to(self.device)
+                labels = labels.to(self.device)
+
+                optimizer.zero_grad(set_to_none=True)
+                with autocast(enabled=self.cfg.use_amp):
+                    logits = model(imgs)
+                    loss = criterion(logits, labels)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                epoch_losses.append(loss.item())
+                preds = torch.argmax(logits, dim=1).detach().cpu().numpy()
+                prs.extend(preds.tolist())
+                gts.extend(labels.detach().cpu().numpy().tolist())
+
+            scheduler.step()
+            train_f1 = f1_score(gts, prs, average="macro")
+            val_f1, val_loss = self._validate(model, dl_val, criterion)
+
+            print(f"Fold {fold} | Epoch {epoch+1}/{self.cfg.epochs} | train_loss={np.mean(epoch_losses):.4f} train_f1={train_f1:.4f} | val_loss={val_loss:.4f} val_f1={val_f1:.4f}")
+
+            if val_f1 > best_f1:
+                best_f1 = val_f1
+                torch.save(model.state_dict(), best_path)
+
+        print(f"Fold {fold} best val F1: {best_f1:.4f}")
+        return best_f1, best_path
+
+    def predict_test_ensemble(self, checkpoints: List[str]) -> List[int]:
+        test_files = sorted([f for f in os.listdir(self.cfg.test_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+        test_paths = [os.path.join(self.cfg.test_dir, f) for f in test_files]
+
+        tta_list = get_tta_transforms(self.cfg)
+        probs_sum = None
+
+        for ckpt in checkpoints:
+            model = self._make_model()
+            state = torch.load(ckpt, map_location=self.device)
+            model.load_state_dict(state, strict=True)
+            model.eval()
+
+            fold_probs = None
+            with torch.no_grad():
+                for tta_tf in tta_list[: self.cfg.tta_n]:
+                    ds = TestImages(test_paths, self.cfg, tta_tf)
+                    dl = DataLoader(ds, batch_size=self.cfg.batch_size, shuffle=False,
+                                    num_workers=self.cfg.num_workers, pin_memory=True)
+
+                    tta_probs_batches = []
+                    for imgs, _ in dl:
+                        imgs = imgs.to(self.device)
+                        with autocast(enabled=self.cfg.use_amp):
+                            logits = model(imgs)
+                            probs = torch.softmax(logits, dim=1).cpu().numpy()
+                        tta_probs_batches.append(probs)
+                    tta_probs = np.vstack(tta_probs_batches)
+
+                    if fold_probs is None:
+                        fold_probs = tta_probs
+                    else:
+                        fold_probs += tta_probs
+
+            fold_probs /= min(len(tta_list), self.cfg.tta_n)
+
+            if probs_sum is None:
+                probs_sum = fold_probs
+            else:
+                probs_sum += fold_probs
+
+        probs_avg = probs_sum / len(checkpoints)
+        final_preds = np.argmax(probs_avg, axis=1).tolist()
+        return final_preds
+
+
+def load_label_map(label_map_path: str, cfg: Config) -> pd.DataFrame:
+    df = pd.read_csv(label_map_path)
+    cols = set(df.columns)
+    df.columns = [c.strip() for c in df.columns]
+    one_hot = set(cfg.class_names)
+
+    if one_hot.issubset(df.columns):
+        df["label_name"] = df[list(one_hot)].idxmax(axis=1)
+        df["label"] = df["label_name"].map(cfg.class_to_idx).astype(int)
+    elif "label" in df.columns:
+        if df["label"].dtype == object:
+            df["label"] = df["label"].map(lambda x: cfg.class_to_idx[str(x)])
+        else:
+            df["label"] = df["label"].astype(int)
     else:
-        raise ValueError('label_map csv has unexpected columns')
+        raise ValueError(f"label_map csv has unexpected columns: {df.columns.tolist()}")
 
-    if 'filename' not in df_map.columns:
-        raise ValueError('label_map must contain filename column')
+    if "filename" not in df.columns:
+        raise ValueError("label_map must contain 'filename' column")
 
-    if 'id' not in df_map.columns:
-        df_map['id'] = df_map['filename'].apply(lambda x: Path(x).stem)
+    df["exists"] = df["filename"].apply(lambda f: os.path.exists(os.path.join(cfg.train_dir, f)))
+    missing = df.loc[~df["exists"]]
+    if len(missing) > 0:
+        print(f"Warning: {len(missing)} files from label_map not found in train_dir. They will be dropped.")
+        df = df.loc[df["exists"]].copy()
+    df = df.drop(columns=["exists"])
 
-    X = df_map['filename'].values
-    y = df_map['label'].values
-
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    fold_results = []
-    model_paths = []
-
-    for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
-        print(f"Starting fold {fold+1}/{n_splits}")
-        train_df = df_map.iloc[tr_idx].reset_index(drop=True)
-        val_df = df_map.iloc[val_idx].reset_index(drop=True)
-
-        model = ConvNextTinyWrapper(num_classes=6, pretrained=True, in_chans=1)
-        trainer = Trainer(model, device, output_dir=out_dir, model_name='convnext_tiny')
-
-        best_f1, best_path = trainer.train_fold(train_df, val_df, img_dir=train_dir,
-                                                epochs=epochs, batch_size=batch_size, lr=lr)
-        print(f"Fold {fold+1} best val F1: {best_f1:.4f}")
-        fold_results.append(best_f1)
-        model_paths.append(best_path)
-
-    print("All folds finished. F1 per fold:", fold_results)
-    print("Mean F1:", np.mean(fold_results))
-    return model_paths, fold_results
+    return df[["filename", "label"]].reset_index(drop=True)
 
 
-def save_submission(final_preds: List[int], output_dir: str, model_name: str):
-    os.makedirs(output_dir, exist_ok=True)
+def run_training_kfold(cfg: Config) -> Tuple[List[str], List[float]]:
+    seed_everything(cfg.seed)
+
+    df = load_label_map(cfg.label_map_path, cfg)
+
+    X = df["filename"].values
+    y = df["label"].values
+
+    skf = StratifiedKFold(n_splits=cfg.n_splits, shuffle=True, random_state=cfg.seed)
+    trainer = Trainer(cfg)
+    fold_paths = []
+    fold_scores = []
+
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y), start=1):
+        print(f"Starting fold {fold}/{cfg.n_splits}")
+        tr_df = df.iloc[tr_idx].reset_index(drop=True)
+        va_df = df.iloc[val_idx].reset_index(drop=True)
+
+        best_f1, best_path = trainer.train_fold(fold, tr_df, va_df)
+        fold_paths.append(best_path)
+        fold_scores.append(best_f1)
+
+    print("All folds finished. F1 per fold:", fold_scores)
+    print("Mean F1:", float(np.mean(fold_scores)))
+
+    final_preds = trainer.predict_test_ensemble(fold_paths)
+    os.makedirs(cfg.output_dir, exist_ok=True)
     sub_df = pd.DataFrame({
-        "idx": range(1, len(final_preds)+1),
-        "label": final_preds
+        "idx": range(1, len(final_preds) + 1),
+        "label": final_preds,
     })
-    sub_path = os.path.join(output_dir, f"{model_name}_submission.csv")
+    sub_path = os.path.join(cfg.output_dir, f"{cfg.backbone}_submission.csv")
     sub_df.to_csv(sub_path, index=False)
-    print(f"Submission saved to {sub_path}")
+    print(f"Submission saved to: {sub_path}")
+
+    return fold_paths, fold_scores
 
 
-if __name__ == '__main__':
-    train_dir = "train_folder/train"
-    label_map_path = "train_folder/train/_classes.csv"
-    out_dir = "submissions"
-
-    model_paths, fold_results = run_training_kfold(train_dir, label_map_path,
-                                                   out_dir, n_splits=5, epochs=20, batch_size=32, lr=1e-3)
-
-    print('Done')
+if __name__ == "__main__":
+    cfg = Config()
+    run_training_kfold(cfg)
